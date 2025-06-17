@@ -1,0 +1,10 @@
+torch
+torchvision
+torchaudio
+pytorch-lightning
+sentencepiece
+av
+hydra-core
+six
+matplotlib
+scikit-learn
