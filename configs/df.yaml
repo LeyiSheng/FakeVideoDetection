@@ -15,14 +15,14 @@ exp_dir:
 exp_name:
 gpus: 
 slurm_job_id:
-file_path: /work/lixiaolou/program/auto_avsr/data/FakeAVCeleb/label_test_updated.csv
-ckpt_path: /work/lixiaolou/program/auto_avsr/pretrained_model/avsr_trlrwlrs2lrs3vox2avsp_base.pth
-audio_ckpt_path: /work/lixiaolou/program/auto_avsr/pretrained_model/asr_trlrwlrs2lrs3vox2avsp_base.pth
-video_ckpt_path: /work/lixiaolou/program/auto_avsr/pretrained_model/vsr_trlrwlrs2lrs3vox2avsp_base.pth
+file_path: /hpc2hdd/home/lsheng847/1122321/FakeVideoDetection/data/DFDC/label.csv
+ckpt_path: /hpc2hdd/home/lsheng847/1122321/FakeVideoDetection/pretrained_model/avsr_trlrwlrs2lrs3vox2avsp_base.pth
+audio_ckpt_path: /hpc2hdd/home/lsheng847/1122321/FakeVideoDetection/pretrained_model/LRS3_A_WER1.0/model.pth
+video_ckpt_path: /hpc2hdd/home/lsheng847/1122321/FakeVideoDetection/pretrained_model/LRS3_V_WER19.1/model.pth
 pretrained_model_path:
 transfer_frontend:
 transfer_encoder:
 device: 'cuda'
-infer_path: /work/lixiaolou/program/auto_avsr/infer/fakeavceleb_ctc.json
+infer_path: /hpc2hdd/home/lsheng847/1122321/FakeVideoDetection/infer/fakeavceleb_ctc.json
 asr_infer_path:
 

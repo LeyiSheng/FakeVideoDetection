@@ -18,7 +18,7 @@ from espnet.nets.scorers.ctc import CTCPrefixScorer
 
 from pytorch_lightning import seed_everything
 
-NOISE_FILENAME = './datamodule/babble_noise.wav'
+NOISE_FILENAME = './datamodule/babble.wav'
 
 
 def filelist(listcsv):
@@ -31,7 +31,7 @@ def filelist(listcsv):
         fn = fn.replace('/audio/', '/video/')
         fn = fn.replace('.wav', '.mp4')
         
-        if os.path.exists(fn):
+        if True:#os.path.exists(fn):
             fns.append((fn.strip(), length.strip(), label.strip(), audio_label.strip(), video_label.strip(), target.strip()))
     return fns
 
@@ -134,6 +134,8 @@ def main(cfg):
     total_length = 0
     total_edit_distance = 0
     infos = {}
+    
+    print(f"Number of files loaded: {len(fns)}")
     
     for i, (fn, length, label, audio_label, video_label, target) in enumerate(tqdm(fns)):
         video = torchvision.io.read_video(fn, pts_unit="sec", output_format="THWC")[0]

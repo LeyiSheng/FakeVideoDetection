@@ -18,7 +18,7 @@ from espnet.nets.scorers.ctc import CTCPrefixScorer
 
 from pytorch_lightning import seed_everything
 
-NOISE_FILENAME = './datamodule/babble_noise.wav'
+NOISE_FILENAME = './datamodule/babble.wav'
 
 def filelist(listcsv):
     fns = []
@@ -38,10 +38,14 @@ def filelist_dfdc(listcsv):
     for line in lines:
         fn, length, label, audio_label, video_label = line.split(',')
 
+        #fn = fn.strip()
         fn = fn.replace('/video/', '/audio/')
+        
         fn = fn.replace('.mp4', '.wav')
 
-        if os.path.exists(fn):
+        if not os.path.exists(fn):
+            print(f"File not found: {fn}")
+        else:
             fns.append((fn.strip(), length.strip(), label.strip(), audio_label.strip(), video_label.strip()))
     return fns
 
@@ -128,14 +132,14 @@ def main(cfg):
     device = cfg.device
     
     audio_pipeline = torch.nn.Sequential(
-        AddNoise(snr_target=cfg.decode.snr_target)
-        if cfg.decode.snr_target is not None
-        else FunctionalModule(lambda x: x),
+        #AddNoise(snr_target=cfg.decode.snr_target)
+        #if cfg.decode.snr_target is not None
+        #else
+        FunctionalModule(lambda x: x),
         FunctionalModule(
             lambda x: torch.nn.functional.layer_norm(x, x.shape, eps=1e-8)
         ),
-    )   
-    
+    )
     text_transform = TextTransform()
     token_list = text_transform.token_list
     
@@ -144,8 +148,9 @@ def main(cfg):
     model.load_state_dict(ckpt)
     model.eval()
     beam_search = get_beam_search_decoder(model, token_list)
-    
-    fns = filelist(cfg.file_path)
+    print("Model loaded successfully.")
+    fns = filelist_dfdc(cfg.file_path)
+    print(f"Number of files to process: {len(fns)}")
     
     logging.info('loading fns...')
     
@@ -172,3 +177,4 @@ def main(cfg):
 
 if __name__ == "__main__":
     main()
+    print("ASR inference completed successfully.")

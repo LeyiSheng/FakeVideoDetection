@@ -2,7 +2,6 @@ import json
 import os
 from dataclasses import dataclass
 from typing import Dict, List, Tuple, Optional
-
 import numpy as np
 import matplotlib.pyplot as plt
 from sklearn.metrics import roc_curve, auc
@@ -11,9 +10,9 @@ from sklearn.metrics import roc_curve, auc
 @dataclass
 class Config:
     save_path: str = 'LAV-DF/ctc_cos'
-    data_path: str = 'Noisy/fakeavceleb_noisy_audio_0.5_video_0.5_vsr'
+    data_path: str = 'DFDC/fakeavceleb_noisy_audio_0_video_0_vsr'
     check_metric: str = 'cos'
-    base_dir: str = '/work/lixiaolou/program/FakeVideoDetection'
+    base_dir: str = '/hpc2hdd/home/lsheng847/1122321/FakeVideoDetection'
     
     @property
     def data_file(self) -> str:
