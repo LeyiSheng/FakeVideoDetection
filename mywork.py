@@ -10,6 +10,8 @@ import random
 import hashlib
 import numpy as np
 import soundfile as sf
+
+os.environ.setdefault("HF_HUB_HTTP_TIMEOUT", "60")
 from tqdm import tqdm
 from pathlib import Path
 from typing import List, Tuple, Dict, Optional
@@ -188,19 +190,35 @@ def ensure_audio_wav(video_path: str, tmp_dir: str, sr: int = 16000) -> str:
 # 4) 加载模型
 # =============================================================
 
-def load_models():
-    print("Loading visual emotion model …")
-    visual_processor = AutoImageProcessor.from_pretrained(config.VISUAL_MODEL_NAME)
-    visual_model = AutoModelForImageClassification.from_pretrained(config.VISUAL_MODEL_NAME).to(config.DEVICE)
-    visual_model.eval()
+def load_models(local_files_only: bool = False):
+    hf_kwargs = {"local_files_only": local_files_only}
 
-    print("Loading audio emotion model …")
-    audio_feat = Wav2Vec2FeatureExtractor.from_pretrained(config.AUDIO_EMOTION_MODEL_NAME)
-    audio_model = AutoModelForAudioClassification.from_pretrained(config.AUDIO_EMOTION_MODEL_NAME).to(config.DEVICE)
-    audio_model.eval()
+    try:
+        print(f"Loading visual emotion model … (local_only={local_files_only})")
+        visual_processor = AutoImageProcessor.from_pretrained(config.VISUAL_MODEL_NAME, **hf_kwargs)
+        visual_model = AutoModelForImageClassification.from_pretrained(
+            config.VISUAL_MODEL_NAME, **hf_kwargs
+        ).to(config.DEVICE)
+        visual_model.eval()
 
-    return {"visual_processor": visual_processor, "visual_model": visual_model,
-            "audio_feature": audio_feat, "audio_model": audio_model}
+        print(f"Loading audio emotion model … (local_only={local_files_only})")
+        audio_feat = Wav2Vec2FeatureExtractor.from_pretrained(config.AUDIO_EMOTION_MODEL_NAME, **hf_kwargs)
+        audio_model = AutoModelForAudioClassification.from_pretrained(
+            config.AUDIO_EMOTION_MODEL_NAME, **hf_kwargs
+        ).to(config.DEVICE)
+        audio_model.eval()
+    except Exception as exc:
+        if not local_files_only:
+            print(f"[WARN] Remote load failed ({exc}); retrying with local cache only …")
+            return load_models(local_files_only=True)
+        raise
+
+    return {
+        "visual_processor": visual_processor,
+        "visual_model": visual_model,
+        "audio_feature": audio_feat,
+        "audio_model": audio_model,
+    }
 
 
 # =============================================================
@@ -268,41 +286,44 @@ def feature_dim_from_models(models) -> int:
 def cache_path_for_video(video_path: str) -> str:
     return os.path.join(config.FEATURE_DIR, f"{sha1_of_text(video_path)}.npz")
 
-def process_video(args):
-    vp, models = args  # 解包参数
-    outp = cache_path_for_video(vp)
-    if os.path.exists(outp) and os.path.getsize(outp) > 0:
-        return
-    try:
-        feat = build_feature_once(vp, models)
-        np.savez_compressed(outp, **feat, video_path=vp)
-    except Exception as e:
-        print(f"[WARN] Feature extraction failed for {vp}: {e}")
-
 import multiprocessing as mp
-from tqdm import tqdm
 
 # 在文件开头设置 multiprocessing 的启动方法为 'spawn'，以支持 CUDA 在子进程中重新初始化
 mp.set_start_method('spawn', force=True)
 
+_WORKER_MODELS = None
+
+
+def _worker_initializer():
+    """Load models once per worker to reuse local cache."""
+    global _WORKER_MODELS
+    try:
+        _WORKER_MODELS = load_models(local_files_only=True)
+    except Exception:
+        _WORKER_MODELS = load_models(local_files_only=False)
+
+
 def process_video(vp):
-    # 在每个子进程中重新加载模型
-    models = load_models()  # 重新加载模型
+    global _WORKER_MODELS
+    if _WORKER_MODELS is None:
+        _WORKER_MODELS = load_models(local_files_only=True)
     outp = cache_path_for_video(vp)
     if os.path.exists(outp) and os.path.getsize(outp) > 0:
         return
     try:
-        feat = build_feature_once(vp, models)
+        feat = build_feature_once(vp, _WORKER_MODELS)
         np.savez_compressed(outp, **feat, video_path=vp)
     except Exception as e:
         print(f"[WARN] Feature extraction failed for {vp}: {e}")
 
-def build_feature_cache(video_paths: List[str], models) -> None:
+
+def build_feature_cache(video_paths: List[str]) -> None:
     safe_makedirs(config.FEATURE_DIR)
-    
+
     # 使用多进程池并行处理
     num_processes = min(mp.cpu_count(), 8)  # 根据CPU核心数调整
-    with mp.Pool(processes=num_processes) as pool:
+    ctx = mp.get_context("spawn")
+    with ctx.Pool(processes=num_processes, initializer=_worker_initializer) as pool:
         list(tqdm(pool.imap(process_video, video_paths), total=len(video_paths), desc="Building feature cache"))
 # =============================================================
 # 6) 数据集
@@ -450,7 +471,7 @@ def main():
 
     # 加载模型并构建特征缓存
     models = load_models()
-    build_feature_cache(train_paths + val_paths + test_paths, models)
+    build_feature_cache(train_paths + val_paths + test_paths)
 
     # 创建数据加载器x
     feat_dim = feature_dim_from_models(models)
@@ -532,7 +553,7 @@ def main_json():
 
     # 加载模型并构建特征缓存
     models = load_models()
-    build_feature_cache(train_paths + val_paths + test_paths, models)
+    build_feature_cache(train_paths + val_paths + test_paths)
 
     # 创建数据加载器
     feat_dim = feature_dim_from_models(models)
