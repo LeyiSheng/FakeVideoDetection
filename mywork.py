@@ -169,7 +169,15 @@ def extract_audio_ffmpeg(video_path: str, wav_path: str, sr: int = 16000) -> boo
         import subprocess
         cmd = ["ffmpeg", "-y", "-i", video_path, "-vn", "-ac", "1", "-ar", str(sr), wav_path]
         result = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
-        return result.returncode == 0 and os.path.exists(wav_path) and os.path.getsize(wav_path) > 0
+        if result.returncode != 0:
+            err = result.stderr.decode("utf-8", errors="ignore").strip()
+            last_line = err.splitlines()[-1] if err else "unknown error"
+            print(f"[WARN] ffmpeg failed for {video_path}: {last_line}")
+            return False
+        if not os.path.exists(wav_path) or os.path.getsize(wav_path) == 0:
+            print(f"[WARN] ffmpeg produced empty audio for {video_path}")
+            return False
+        return True
     except Exception:
         return False
 
@@ -182,7 +190,8 @@ def ensure_audio_wav(video_path: str, tmp_dir: str, sr: int = 16000) -> str:
         return wav_path
     ok = extract_audio_ffmpeg(video_path, wav_path, sr)
     if not ok:
-        raise RuntimeError(f"Audio extraction failed for {video_path}. Please install ffmpeg.")
+        print(f"[WARN] Audio extraction failed for {video_path}. Using silent audio features instead.")
+        return ""
     return wav_path
 
 
@@ -252,7 +261,18 @@ def extract_visual_feature_for_video(video_path: str, models) -> Tuple[np.ndarra
 def extract_audio_feature_for_video(video_path: str, models) -> Tuple[np.ndarray, np.ndarray]:
     tmp_dir = os.path.join(config.FEATURE_DIR, "_tmp_wav")
     wav_path = ensure_audio_wav(video_path, tmp_dir, sr=config.TARGET_SR)
+    if not wav_path:
+        # 回退到静音特征，避免整段流程失败
+        mfcc_mean = np.zeros(13, dtype=np.float32)
+        num_labels = int(getattr(models["audio_model"].config, "num_labels", 3))
+        return mfcc_mean, np.zeros(num_labels, dtype=np.float32)
+
     audio, sr = librosa.load(wav_path, sr=config.TARGET_SR)
+    if audio.size == 0:
+        mfcc_mean = np.zeros(13, dtype=np.float32)
+        num_labels = int(getattr(models["audio_model"].config, "num_labels", 3))
+        return mfcc_mean, np.zeros(num_labels, dtype=np.float32)
+
     mfcc = librosa.feature.mfcc(y=audio, sr=sr, n_mfcc=13)
     mfcc_mean = np.mean(mfcc, axis=1)
     afe, amodel = models["audio_feature"], models["audio_model"]
