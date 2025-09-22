@@ -387,7 +387,7 @@ def evaluate(model, loader, detailed: bool = False):
     
     if detailed:
         print("Classification report:\n", classification_report(all_labels, all_preds, digits=4))
-        print("Confusion matrix:\n", confusion_matrix(all_labels, all_probs))
+        print("Confusion matrix:\n", confusion_matrix(all_labels, all_preds))
         print(f"AUC Score: {auc:.4f}")
     
     return total / max(1, len(loader)), acc, f1, rec, auc
