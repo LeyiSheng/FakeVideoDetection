@@ -17,7 +17,7 @@ from pathlib import Path
 from typing import List, Tuple, Dict, Optional
 
 from sklearn.model_selection import train_test_split
-from sklearn.metrics import accuracy_score, f1_score, recall_score, classification_report, confusion_matrix
+from sklearn.metrics import accuracy_score, f1_score, recall_score, classification_report, confusion_matrix, roc_auc_score
 
 from transformers import AutoImageProcessor, AutoModelForImageClassification
 from transformers import AutoModelForAudioClassification, Wav2Vec2FeatureExtractor
@@ -412,7 +412,7 @@ def train_one_epoch(model, loader, criterion, optimizer):
 
 def evaluate(model, loader, detailed: bool = False):
     model.eval()
-    all_preds, all_labels, total = [], [], 0.0
+    all_preds, all_labels, all_probs, total = [], [], [], 0.0
     criterion = nn.CrossEntropyLoss()
     with torch.no_grad():
         for feats, labels in loader:
@@ -423,14 +423,24 @@ def evaluate(model, loader, detailed: bool = False):
             preds = torch.argmax(logits, dim=1)
             all_preds.append(preds.cpu())
             all_labels.append(labels.cpu())
-    all_preds, all_labels = torch.cat(all_preds), torch.cat(all_labels)
+            probs = torch.softmax(logits, dim=1)[:, 1]
+            all_probs.append(probs.cpu())
+    all_preds = torch.cat(all_preds)
+    all_labels = torch.cat(all_labels)
+    all_probs = torch.cat(all_probs)
     acc = accuracy_score(all_labels, all_preds)
     f1 = f1_score(all_labels, all_preds, average="macro")
     rec = recall_score(all_labels, all_preds, average="macro")
+    try:
+        auc = roc_auc_score(all_labels, all_probs)
+    except ValueError as exc:
+        print(f"[WARN] AUC calculation failed: {exc}")
+        auc = 0.0
     if detailed:
         print("Classification report:\n", classification_report(all_labels, all_preds, digits=4))
         print("Confusion matrix:\n", confusion_matrix(all_labels, all_preds))
-    return total / max(1, len(loader)), acc, f1, rec
+        print(f"AUC Score: {auc:.4f}")
+    return total / max(1, len(loader)), acc, f1, rec, auc
 
 
 # =============================================================
@@ -509,11 +519,11 @@ def main():
     best_val_acc = 0.0
     for epoch in range(config.EPOCHS):
         train_loss = train_one_epoch(model, train_loader, criterion, optimizer)
-        val_loss, val_acc, val_f1, val_rec = evaluate(model, val_loader)
+        val_loss, val_acc, val_f1, val_rec, val_auc = evaluate(model, val_loader)
 
         print(f"Epoch {epoch+1:2d}/{config.EPOCHS} | "
               f"Train Loss: {train_loss:.4f} | "
-              f"Val Loss: {val_loss:.4f}, Acc: {val_acc:.4f}, F1: {val_f1:.4f}, Rec: {val_rec:.4f}")
+              f"Val Loss: {val_loss:.4f}, Acc: {val_acc:.4f}, F1: {val_f1:.4f}, Rec: {val_rec:.4f}, AUC: {val_auc:.4f}")
 
         # 保存最佳模型
         if val_acc > best_val_acc:
@@ -524,9 +534,9 @@ def main():
     # 加载最佳模型并进行测试
     print("\nLoading best model for final test...")
     model.load_state_dict(torch.load(os.path.join(config.FEATURE_DIR, "best_model.pt"), map_location=config.DEVICE))
-    test_loss, test_acc, test_f1, test_rec = evaluate(model, test_loader, detailed=True)
+    test_loss, test_acc, test_f1, test_rec, test_auc = evaluate(model, test_loader, detailed=True)
 
-    print(f"\nFinal Test Results | Loss: {test_loss:.4f}, Acc: {test_acc:.4f}, F1: {test_f1:.4f}, Rec: {test_rec:.4f}")
+    print(f"\nFinal Test Results | Loss: {test_loss:.4f}, Acc: {test_acc:.4f}, F1: {test_f1:.4f}, Rec: {test_rec:.4f}, AUC: {test_auc:.4f}")
 
 def main_json():
     """
@@ -591,7 +601,7 @@ def main_json():
     best_val_acc = 0.0
     for epoch in range(config.EPOCHS):
         train_loss = train_one_epoch(model, train_loader, criterion, optimizer)
-        val_loss, val_acc, val_f1, val_rec = evaluate(model, val_loader)
+        val_loss, val_acc, val_f1, val_rec, val_auc = evaluate(model, val_loader)
 
         import pynvml  # pip install pynvml
 
@@ -601,7 +611,7 @@ def main_json():
         print(f"GPU utilization: {info.gpu}%")
         print(f"Epoch {epoch+1:2d}/{config.EPOCHS} | "
               f"Train Loss: {train_loss:.4f} | "
-              f"Val Loss: {val_loss:.4f}, Acc: {val_acc:.4f}, F1: {val_f1:.4f}, Rec: {val_rec:.4f}")
+              f"Val Loss: {val_loss:.4f}, Acc: {val_acc:.4f}, F1: {val_f1:.4f}, Rec: {val_rec:.4f}, AUC: {val_auc:.4f}")
 
         # 保存最佳模型
         if val_acc > best_val_acc:
@@ -612,9 +622,9 @@ def main_json():
     # 加载最佳模型并进行测试
     print("\nLoading best model for final test...")
     model.load_state_dict(torch.load(os.path.join(config.FEATURE_DIR, "best_model.pt"), map_location=config.DEVICE, weights_only=True))
-    test_loss, test_acc, test_f1, test_rec = evaluate(model, test_loader, detailed=True)
+    test_loss, test_acc, test_f1, test_rec, test_auc = evaluate(model, test_loader, detailed=True)
 
-    print(f"\nFinal Test Results | Loss: {test_loss:.4f}, Acc: {test_acc:.4f}, F1: {test_f1:.4f}, Rec: {test_rec:.4f}")
+    print(f"\nFinal Test Results | Loss: {test_loss:.4f}, Acc: {test_acc:.4f}, F1: {test_f1:.4f}, Rec: {test_rec:.4f}, AUC: {test_auc:.4f}")
 
 # 修改 __main__ 部分
 if __name__ == "__main__":

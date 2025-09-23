@@ -66,6 +66,7 @@ class Config:
 
     DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     TARGET_SR = 16000
+    DISABLE_AUDIO = True  # audio features disabled (set to False to re-enable)
 
     def __init__(self):
         set_seed(self.SEED)
@@ -195,10 +196,15 @@ def load_models():
     visual_model = AutoModelForImageClassification.from_pretrained(config.VISUAL_MODEL_NAME).to(config.DEVICE)
     visual_model.eval()
 
-    print("Loading audio emotion model …")
-    audio_feat = Wav2Vec2FeatureExtractor.from_pretrained(config.AUDIO_EMOTION_MODEL_NAME)
-    audio_model = AutoModelForAudioClassification.from_pretrained(config.AUDIO_EMOTION_MODEL_NAME).to(config.DEVICE)
-    audio_model.eval()
+    if config.DISABLE_AUDIO:
+        audio_feat = None
+        audio_model = None
+        print("Audio features disabled; skipping audio model load.")
+    else:
+        print("Loading audio emotion model …")
+        audio_feat = Wav2Vec2FeatureExtractor.from_pretrained(config.AUDIO_EMOTION_MODEL_NAME)
+        audio_model = AutoModelForAudioClassification.from_pretrained(config.AUDIO_EMOTION_MODEL_NAME).to(config.DEVICE)
+        audio_model.eval()
 
     return {"visual_processor": visual_processor, "visual_model": visual_model,
             "audio_feature": audio_feat, "audio_model": audio_model}
@@ -233,6 +239,11 @@ def extract_visual_feature_for_video(video_path: str, models) -> Tuple[np.ndarra
 
 
 def extract_audio_feature_for_video(video_path: str, models) -> Tuple[np.ndarray, np.ndarray]:
+    if config.DISABLE_AUDIO:
+        audio_model = models.get("audio_model") if isinstance(models, dict) else None
+        num_labels = int(getattr(getattr(audio_model, "config", None), "num_labels", 3))
+        return np.zeros(13, dtype=np.float32), np.zeros(num_labels, dtype=np.float32)
+
     tmp_dir = os.path.join(config.FEATURE_DIR, "_tmp_wav")
     wav_path = ensure_audio_wav(video_path, tmp_dir, sr=config.TARGET_SR)
     audio, sr = librosa.load(wav_path, sr=config.TARGET_SR)
@@ -262,7 +273,8 @@ def feature_vector_from_dict(d: Dict[str, np.ndarray]) -> np.ndarray:
 
 def feature_dim_from_models(models) -> int:
     V = int(getattr(models["visual_model"].config, "num_labels", 8))
-    A = int(getattr(models["audio_model"].config, "num_labels", 3))
+    audio_model = models.get("audio_model") if isinstance(models, dict) else None
+    A = int(getattr(getattr(audio_model, "config", None), "num_labels", 3))
     return V + 3 + 13 + A
 
 
