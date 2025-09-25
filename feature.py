@@ -66,7 +66,8 @@ class Config:
 
     DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     TARGET_SR = 16000
-    DISABLE_AUDIO = True  # audio features disabled (set to False to re-enable)
+    DISABLE_AUDIO = False  # audio features disabled (set to False to re-enable)
+    DISABLE_VISUAL_EMOTION = True  # visual emotion logits disabled (set False to restore)
 
     def __init__(self):
         set_seed(self.SEED)
@@ -191,10 +192,15 @@ def ensure_audio_wav(video_path: str, tmp_dir: str, sr: int = 16000) -> str:
 # =============================================================
 
 def load_models():
-    print("Loading visual emotion model …")
-    visual_processor = AutoImageProcessor.from_pretrained(config.VISUAL_MODEL_NAME)
-    visual_model = AutoModelForImageClassification.from_pretrained(config.VISUAL_MODEL_NAME).to(config.DEVICE)
-    visual_model.eval()
+    if config.DISABLE_VISUAL_EMOTION:
+        visual_processor = None
+        visual_model = None
+        print("Visual emotion logits disabled; skipping visual model load.")
+    else:
+        print("Loading visual emotion model …")
+        visual_processor = AutoImageProcessor.from_pretrained(config.VISUAL_MODEL_NAME)
+        visual_model = AutoModelForImageClassification.from_pretrained(config.VISUAL_MODEL_NAME).to(config.DEVICE)
+        visual_model.eval()
 
     if config.DISABLE_AUDIO:
         audio_feat = None
@@ -220,20 +226,27 @@ def extract_visual_feature_for_video(video_path: str, models) -> Tuple[np.ndarra
         raise RuntimeError(f"No frames extracted: {video_path}")
 
     face_cascade = cv2.CascadeClassifier(cv2.data.haarcascades + 'haarcascade_frontalface_default.xml')
-    proc = models["visual_processor"]
-    vmodel = models["visual_model"]
-
     logits_list, metrics_list = [], []
+
+    visual_processor = models.get("visual_processor") if isinstance(models, dict) else None
+    visual_model = models.get("visual_model") if isinstance(models, dict) else None
+
     for fr in frames:
         face = detect_and_crop_face(fr, face_cascade, target_size=config.FRAME_SIZE)
         metrics_list.append(calc_visual_metrics(face))
-        inputs = proc(images=face, return_tensors="pt")
+        if config.DISABLE_VISUAL_EMOTION or visual_processor is None or visual_model is None:
+            continue
+        inputs = visual_processor(images=face, return_tensors="pt")
         inputs = {k: v.to(config.DEVICE) for k, v in inputs.items()}
         with torch.no_grad():
-            out = vmodel(**inputs)
+            out = visual_model(**inputs)
         logits_list.append(out.logits.squeeze().cpu().numpy())
 
-    v_logits_mean = np.mean(np.stack(logits_list, axis=0), axis=0)
+    if config.DISABLE_VISUAL_EMOTION or not logits_list:
+        num_labels = int(getattr(getattr(visual_model, "config", None), "num_labels", 8))
+        v_logits_mean = np.zeros(num_labels, dtype=np.float32)
+    else:
+        v_logits_mean = np.mean(np.stack(logits_list, axis=0), axis=0)
     v_metrics_mean = np.mean(np.stack(metrics_list, axis=0), axis=0)
     return v_logits_mean, v_metrics_mean
 
@@ -272,7 +285,8 @@ def feature_vector_from_dict(d: Dict[str, np.ndarray]) -> np.ndarray:
 
 
 def feature_dim_from_models(models) -> int:
-    V = int(getattr(models["visual_model"].config, "num_labels", 8))
+    visual_model = models.get("visual_model") if isinstance(models, dict) else None
+    V = int(getattr(getattr(visual_model, "config", None), "num_labels", 8))
     audio_model = models.get("audio_model") if isinstance(models, dict) else None
     A = int(getattr(getattr(audio_model, "config", None), "num_labels", 3))
     return V + 3 + 13 + A
