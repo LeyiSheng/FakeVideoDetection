@@ -312,10 +312,29 @@ def build_feature_cache(video_paths: List[str], models) -> None:
 # =============================================================
 # 6) 数据集
 # =============================================================
+PREDICTION_KEYS = ("overall", "audio", "video")
+
+
 class FeatureDataset(Dataset):
-    def __init__(self, video_paths: List[str], overall_labels: List[int]):
+    def __init__(
+        self,
+        video_paths: List[str],
+        overall_labels: List[int],
+        audio_labels: Optional[List[int]] = None,
+        video_labels: Optional[List[int]] = None,
+    ):
+        if audio_labels is None:
+            audio_labels = overall_labels
+        if video_labels is None:
+            video_labels = overall_labels
+
+        if not (len(video_paths) == len(overall_labels) == len(audio_labels) == len(video_labels)):
+            raise ValueError("Video paths and label lists must have the same length")
+
         self.video_paths = video_paths
-        self.labels = overall_labels
+        self.overall_labels = overall_labels
+        self.audio_labels = audio_labels
+        self.video_labels = video_labels
 
     def __len__(self):
         return len(self.video_paths)
@@ -332,13 +351,30 @@ class FeatureDataset(Dataset):
             "mfcc": data["mfcc"],
             "audio_logits": data["audio_logits"],
         })
-        return torch.tensor(feat, dtype=torch.float32), torch.tensor(int(self.labels[idx]), dtype=torch.long)
+        labels = {
+            "overall": torch.tensor(int(self.overall_labels[idx]), dtype=torch.long),
+            "audio": torch.tensor(int(self.audio_labels[idx]), dtype=torch.long),
+            "video": torch.tensor(int(self.video_labels[idx]), dtype=torch.long),
+        }
+        return torch.tensor(feat, dtype=torch.float32), labels
 
 
-def create_loader(video_paths, overall_labels, batch_size, shuffle):
+def create_loader(
+    video_paths,
+    overall_labels,
+    batch_size,
+    shuffle,
+    audio_labels: Optional[List[int]] = None,
+    video_labels: Optional[List[int]] = None,
+):
     num_workers = min(4, os.cpu_count() or 2)
     pin = config.DEVICE.type == "cuda"
-    ds = FeatureDataset(video_paths, overall_labels)
+    ds = FeatureDataset(
+        video_paths,
+        overall_labels,
+        audio_labels=audio_labels,
+        video_labels=video_labels,
+    )
     return DataLoader(ds, batch_size=batch_size, shuffle=shuffle, num_workers=num_workers, pin_memory=pin)
 
 
@@ -346,14 +382,18 @@ def create_loader(video_paths, overall_labels, batch_size, shuffle):
 # 7) 分类器
 # =============================================================
 class MLPDetector(nn.Module):
-    def __init__(self, input_dim: int):
+    def __init__(self, input_dim: int, hidden_dim: int = 256):
         super().__init__()
-        self.net = nn.Sequential(
-            nn.Linear(input_dim, 256), nn.ReLU(inplace=True), nn.Dropout(0.5), nn.Linear(256, 2)
+        self.backbone = nn.Sequential(
+            nn.Linear(input_dim, hidden_dim),
+            nn.ReLU(inplace=True),
+            nn.Dropout(0.5),
         )
+        self.heads = nn.ModuleDict({key: nn.Linear(hidden_dim, 2) for key in PREDICTION_KEYS})
 
     def forward(self, x):
-        return self.net(x)
+        shared = self.backbone(x)
+        return {name: head(shared) for name, head in self.heads.items()}
 
 
 # =============================================================
@@ -363,60 +403,86 @@ class MLPDetector(nn.Module):
 def train_one_epoch(model, loader, criterion, optimizer):
     model.train()
     total = 0.0
+    head_totals = {key: 0.0 for key in PREDICTION_KEYS}
     for feats, labels in loader:
-        feats, labels = feats.to(config.DEVICE), labels.to(config.DEVICE)
+        feats = feats.to(config.DEVICE)
+        labels = {k: v.to(config.DEVICE) for k, v in labels.items()}
         optimizer.zero_grad(set_to_none=True)
         logits = model(feats)
-        loss = criterion(logits, labels)
+        loss = 0.0
+        for key in PREDICTION_KEYS:
+            head_loss = criterion(logits[key], labels[key])
+            loss = loss + head_loss
+            head_totals[key] += head_loss.item()
         loss.backward()
         optimizer.step()
         total += float(loss.item())
-    return total / max(1, len(loader))
+    denom = max(1, len(loader))
+    head_avg = {key: val / denom for key, val in head_totals.items()}
+    return total / denom, head_avg
 
 
 def evaluate(model, loader, detailed: bool = False):
     model.eval()
-    all_preds, all_labels, all_probs, total = [], [], [], 0.0
     criterion = nn.CrossEntropyLoss()
+    total = 0.0
+    head_totals = {key: 0.0 for key in PREDICTION_KEYS}
+    preds_collection = {key: [] for key in PREDICTION_KEYS}
+    labels_collection = {key: [] for key in PREDICTION_KEYS}
+    probs_collection = {key: [] for key in PREDICTION_KEYS}
+
     with torch.no_grad():
         for feats, labels in loader:
-            feats, labels = feats.to(config.DEVICE), labels.to(config.DEVICE)
+            feats = feats.to(config.DEVICE)
+            labels = {k: v.to(config.DEVICE) for k, v in labels.items()}
             logits = model(feats)
-            loss = criterion(logits, labels)
+
+            loss = 0.0
+            for key in PREDICTION_KEYS:
+                head_loss = criterion(logits[key], labels[key])
+                head_totals[key] += head_loss.item()
+                loss = loss + head_loss
+
+                preds_collection[key].append(torch.argmax(logits[key], dim=1).cpu())
+                labels_collection[key].append(labels[key].cpu())
+                probs_collection[key].append(torch.softmax(logits[key], dim=1)[:, 1].cpu())
+
             total += float(loss.item())
-            
-            # 获取预测类别
-            preds = torch.argmax(logits, dim=1)
-            all_preds.append(preds.cpu())
-            all_labels.append(labels.cpu())
-            
-            # 获取预测概率（用于AUC计算）
-            probs = torch.softmax(logits, dim=1)[:, 1]  # 取正类(1)的概率
-            all_probs.append(probs.cpu())
-            
-    all_preds = torch.cat(all_preds)
-    all_labels = torch.cat(all_labels)
-    all_probs = torch.cat(all_probs)
-    
-    # 计算各种指标
-    acc = accuracy_score(all_labels, all_preds)
-    f1 = f1_score(all_labels, all_preds, average="macro")
-    rec = recall_score(all_labels, all_preds, average="macro")
-    
-    # 计算AUC
-    try:
-        auc = roc_auc_score(all_labels, all_probs)
-    except ValueError as e:
-        # 如果只有一个类别，AUC无法计算
-        print(f"[WARN] AUC calculation failed: {e}")
-        auc = 0.0
-    
-    if detailed:
-        print("Classification report:\n", classification_report(all_labels, all_preds, digits=4))
-        print("Confusion matrix:\n", confusion_matrix(all_labels, all_preds))
-        print(f"AUC Score: {auc:.4f}")
-    
-    return total / max(1, len(loader)), acc, f1, rec, auc
+
+    denom = max(1, len(loader))
+    head_avg = {key: val / denom for key, val in head_totals.items()}
+
+    metrics = {}
+    for key in PREDICTION_KEYS:
+        y_pred = torch.cat(preds_collection[key]) if preds_collection[key] else torch.empty(0, dtype=torch.long)
+        y_true = torch.cat(labels_collection[key]) if labels_collection[key] else torch.empty(0, dtype=torch.long)
+        y_prob = torch.cat(probs_collection[key]) if probs_collection[key] else torch.empty(0, dtype=torch.float)
+
+        if y_pred.numel() == 0:
+            metrics[key] = {"acc": 0.0, "f1": 0.0, "rec": 0.0, "auc": 0.0}
+            continue
+
+        y_pred_np = y_pred.numpy()
+        y_true_np = y_true.numpy()
+        y_prob_np = y_prob.numpy()
+
+        acc = accuracy_score(y_true_np, y_pred_np)
+        f1 = f1_score(y_true_np, y_pred_np, average="macro")
+        rec = recall_score(y_true_np, y_pred_np, average="macro")
+        try:
+            auc = roc_auc_score(y_true_np, y_prob_np)
+        except ValueError as e:
+            print(f"[WARN] AUC calculation failed for {key}: {e}")
+            auc = 0.0
+
+        metrics[key] = {"acc": acc, "f1": f1, "rec": rec, "auc": auc}
+
+        if detailed:
+            print(f"[{key}] Classification report:\n{classification_report(y_true_np, y_pred_np, digits=4)}")
+            print(f"[{key}] Confusion matrix:\n{confusion_matrix(y_true_np, y_pred_np)}")
+            print(f"[{key}] AUC Score: {auc:.4f}")
+
+    return total / denom, head_avg, metrics
 
 
 # =============================================================
@@ -481,9 +547,30 @@ def main():
 
     # 创建数据加载器x
     feat_dim = feature_dim_from_models(models)
-    train_loader = create_loader(train_paths, train_overall, batch_size=config.BATCH_SIZE, shuffle=True)
-    val_loader = create_loader(val_paths, val_overall, batch_size=config.BATCH_SIZE, shuffle=False)
-    test_loader = create_loader(test_paths, test_overall, batch_size=config.BATCH_SIZE, shuffle=False)
+    train_loader = create_loader(
+        train_paths,
+        train_overall,
+        batch_size=config.BATCH_SIZE,
+        shuffle=True,
+        audio_labels=train_audio,
+        video_labels=train_video,
+    )
+    val_loader = create_loader(
+        val_paths,
+        val_overall,
+        batch_size=config.BATCH_SIZE,
+        shuffle=False,
+        audio_labels=val_audio,
+        video_labels=val_video,
+    )
+    test_loader = create_loader(
+        test_paths,
+        test_overall,
+        batch_size=config.BATCH_SIZE,
+        shuffle=False,
+        audio_labels=test_audio,
+        video_labels=test_video,
+    )
 
     # 初始化分类器
     print(f"Feature dimension: {feat_dim}")
@@ -494,25 +581,36 @@ def main():
     # 训练循环
     best_val_acc = 0.0
     for epoch in range(config.EPOCHS):
-        train_loss = train_one_epoch(model, train_loader, criterion, optimizer)
-        val_loss, val_acc, val_f1, val_rec, val_auc = evaluate(model, val_loader)  # 添加val_auc
+        train_loss, train_head_losses = train_one_epoch(model, train_loader, criterion, optimizer)
+        val_loss, val_head_losses, val_metrics = evaluate(model, val_loader)
 
-        print(f"Epoch {epoch+1:2d}/{config.EPOCHS} | "
-              f"Train Loss: {train_loss:.4f} | "
-              f"Val Loss: {val_loss:.4f}, Acc: {val_acc:.4f}, F1: {val_f1:.4f}, Rec: {val_rec:.4f}, AUC: {val_auc:.4f}")
+        print(f"Epoch {epoch+1:2d}/{config.EPOCHS} | Train Loss: {train_loss:.4f} | Val Loss: {val_loss:.4f}")
+        for key in PREDICTION_KEYS:
+            stats = val_metrics[key]
+            print(
+                f"  {key.capitalize():7s} -> TrainLoss: {train_head_losses[key]:.4f}, "
+                f"ValLoss: {val_head_losses[key]:.4f}, Acc: {stats['acc']:.4f}, "
+                f"F1: {stats['f1']:.4f}, Rec: {stats['rec']:.4f}, AUC: {stats['auc']:.4f}"
+            )
 
-        # 保存最佳模型
-        if val_acc > best_val_acc:
-            best_val_acc = val_acc
+        current_acc = val_metrics["overall"]["acc"]
+        if current_acc > best_val_acc:
+            best_val_acc = current_acc
             torch.save(model.state_dict(), os.path.join(config.FEATURE_DIR, "best_model.pt"))
-            print(f"  [+] Best model saved with val acc: {val_acc:.4f}")
+            print(f"  [+] Best model saved with val overall acc: {current_acc:.4f}")
 
     # 加载最佳模型并进行测试
     print("\nLoading best model for final test...")
     model.load_state_dict(torch.load(os.path.join(config.FEATURE_DIR, "best_model.pt"), map_location=config.DEVICE))
-    test_loss, test_acc, test_f1, test_rec, test_auc = evaluate(model, test_loader, detailed=True)  # 添加test_auc
+    test_loss, test_head_losses, test_metrics = evaluate(model, test_loader, detailed=True)
 
-    print(f"\nFinal Test Results | Loss: {test_loss:.4f}, Acc: {test_acc:.4f}, F1: {test_f1:.4f}, Rec: {test_rec:.4f}, AUC: {test_auc:.4f}")
+    print(f"\nFinal Test Results | Loss: {test_loss:.4f}")
+    for key in PREDICTION_KEYS:
+        stats = test_metrics[key]
+        print(
+            f"  {key.capitalize():7s} -> Loss: {test_head_losses[key]:.4f}, "
+            f"Acc: {stats['acc']:.4f}, F1: {stats['f1']:.4f}, Rec: {stats['rec']:.4f}, AUC: {stats['auc']:.4f}"
+        )
 
 def main_json():
     """
@@ -576,8 +674,8 @@ def main_json():
     # 训练循环
     best_val_acc = 0.0
     for epoch in range(config.EPOCHS):
-        train_loss = train_one_epoch(model, train_loader, criterion, optimizer)
-        val_loss, val_acc, val_f1, val_rec, val_auc = evaluate(model, val_loader)
+        train_loss, train_head_losses = train_one_epoch(model, train_loader, criterion, optimizer)
+        val_loss, val_head_losses, val_metrics = evaluate(model, val_loader)
 
         import pynvml  # pip install pynvml
 
@@ -585,22 +683,33 @@ def main_json():
         handle = pynvml.nvmlDeviceGetHandleByIndex(0)
         info = pynvml.nvmlDeviceGetUtilizationRates(handle)
         print(f"GPU utilization: {info.gpu}%")
-        print(f"Epoch {epoch+1:2d}/{config.EPOCHS} | "
-              f"Train Loss: {train_loss:.4f} | "
-              f"Val Loss: {val_loss:.4f}, Acc: {val_acc:.4f}, F1: {val_f1:.4f}, Rec: {val_rec:.4f}, AUC: {val_auc:.4f}")
+        print(f"Epoch {epoch+1:2d}/{config.EPOCHS} | Train Loss: {train_loss:.4f} | Val Loss: {val_loss:.4f}")
+        for key in PREDICTION_KEYS:
+            stats = val_metrics[key]
+            print(
+                f"  {key.capitalize():7s} -> TrainLoss: {train_head_losses[key]:.4f}, "
+                f"ValLoss: {val_head_losses[key]:.4f}, Acc: {stats['acc']:.4f}, "
+                f"F1: {stats['f1']:.4f}, Rec: {stats['rec']:.4f}, AUC: {stats['auc']:.4f}"
+            )
 
-        # 保存最佳模型
-        if val_acc > best_val_acc:
-            best_val_acc = val_acc
+        current_acc = val_metrics["overall"]["acc"]
+        if current_acc > best_val_acc:
+            best_val_acc = current_acc
             torch.save(model.state_dict(), os.path.join(config.FEATURE_DIR, "best_model.pt"))
-            print(f"  [+] Best model saved with val acc: {val_acc:.4f}")
+            print(f"  [+] Best model saved with val overall acc: {current_acc:.4f}")
 
     # 加载最佳模型并进行测试
     print("\nLoading best model for final test...")
     model.load_state_dict(torch.load(os.path.join(config.FEATURE_DIR, "best_model.pt"), map_location=config.DEVICE, weights_only=True))
-    test_loss, test_acc, test_f1, test_rec, test_auc = evaluate(model, test_loader, detailed=True)
+    test_loss, test_head_losses, test_metrics = evaluate(model, test_loader, detailed=True)
 
-    print(f"\nFinal Test Results | Loss: {test_loss:.4f}, Acc: {test_acc:.4f}, F1: {test_f1:.4f}, Rec: {test_rec:.4f}, AUC: {test_auc:.4f}")
+    print(f"\nFinal Test Results | Loss: {test_loss:.4f}")
+    for key in PREDICTION_KEYS:
+        stats = test_metrics[key]
+        print(
+            f"  {key.capitalize():7s} -> Loss: {test_head_losses[key]:.4f}, "
+            f"Acc: {stats['acc']:.4f}, F1: {stats['f1']:.4f}, Rec: {stats['rec']:.4f}, AUC: {stats['auc']:.4f}"
+        )
 
 # 修改 __main__ 部分
 if __name__ == "__main__":
